@@ -1,0 +1,7 @@
+torch>=2.2.0
+transformers>=4.40.0
+datasets>=2.19.0
+scikit-learn>=1.4.0
+numpy>=1.26.0
+bitsandbytes>=0.43.0   # 4-bit quantization for GPU
+accelerate>=0.29.0     # required by transformers device_map
