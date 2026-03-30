@@ -140,11 +140,11 @@ class LlamaClassifier:
                 device_map="cpu",
             )
 
-        tokenizer = LlamaAutoTokenizer.from_pretrained(model_name)
+        self.tokenizer = LlamaAutoTokenizer.from_pretrained(model_name)
         self.pipe = pipeline(
             "text-generation",
             model=model,
-            tokenizer=tokenizer,
+            tokenizer=self.tokenizer,
             max_new_tokens=16,
             do_sample=False,
             temperature=None,
@@ -155,15 +155,20 @@ class LlamaClassifier:
         """
         Ask the LLM whether `text` answers / is relevant to `query`.
         Returns 'yes' or 'no'.
+        Uses tokenizer.apply_chat_template() so the prompt format is correct
+        for any model (TinyLlama, Llama 3.2, etc.).
         """
-        prompt = (
-            f"<|system|>\nYou are a precise text classifier. "
-            f"Answer only with 'yes' or 'no'.\n</s>\n"
-            f"<|user|>\nDoes the following passage answer or address this question?\n\n"
-            f"Question: {query}\n\n"
-            f"Passage: {text}\n\n"
-            f"Answer with only 'yes' or 'no'.\n</s>\n"
-            f"<|assistant|>\n"
+        messages = [
+            {"role": "system", "content": "You are a precise text classifier. Answer only with 'yes' or 'no'."},
+            {"role": "user", "content": (
+                f"Does the following passage answer or address this question?\n\n"
+                f"Question: {query}\n\n"
+                f"Passage: {text}\n\n"
+                f"Answer with only 'yes' or 'no'."
+            )},
+        ]
+        prompt = self.tokenizer.apply_chat_template(
+            messages, tokenize=False, add_generation_prompt=True,
         )
         result = self.pipe(prompt)[0]["generated_text"]
         # extract only the new tokens after the prompt
