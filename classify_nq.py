@@ -43,11 +43,13 @@ from sklearn.metrics import classification_report
 # ---------------------------------------------------------------------------
 
 DEFAULT_LLAMA_MODEL = "meta-llama/Llama-3.2-1B-Instruct"
+TINYLLAMA_MODEL = "TinyLlama/TinyLlama-1.1B-Chat-v1.0"
 BERT_MODEL = "bert-base-uncased"
 SIMILARITY_THRESHOLD = 0.55   # cosine similarity gate for pruning
 MAX_CHUNK_TOKENS = 256         # tokens per chunk when recursing
 MIN_CHUNK_WORDS = 20           # stop recursing when chunk is this small
 MAX_RECURSION_DEPTH = 3
+MAX_DOC_WORDS = 500           # truncate documents for faster runs
 NQ_TRAIN_SPLIT = "train"
 NQ_VALIDATION_SPLIT = "validation"
 
@@ -134,7 +136,7 @@ class LlamaClassifier:
         else:
             model = AutoModelForCausalLM.from_pretrained(
                 model_name,
-                torch_dtype=torch.float32,
+                dtype=torch.float32,
                 device_map="cpu",
             )
 
@@ -155,13 +157,13 @@ class LlamaClassifier:
         Returns 'yes' or 'no'.
         """
         prompt = (
-            f"<|system|>You are a precise text classifier. "
-            f"Answer only with 'yes' or 'no'.<|end|>\n"
-            f"<|user|>Does the following passage answer or address this question?\n\n"
+            f"<|system|>\nYou are a precise text classifier. "
+            f"Answer only with 'yes' or 'no'.\n</s>\n"
+            f"<|user|>\nDoes the following passage answer or address this question?\n\n"
             f"Question: {query}\n\n"
             f"Passage: {text}\n\n"
-            f"Answer with only 'yes' or 'no'.<|end|>\n"
-            f"<|assistant|>"
+            f"Answer with only 'yes' or 'no'.\n</s>\n"
+            f"<|assistant|>\n"
         )
         result = self.pipe(prompt)[0]["generated_text"]
         # extract only the new tokens after the prompt
@@ -266,7 +268,7 @@ def classify_node_recursive(
 # Dataset loading
 # ---------------------------------------------------------------------------
 
-def load_nq_examples(n: int = 100, split: str = NQ_VALIDATION_SPLIT) -> list[dict]:
+def load_nq_examples(n: int = 100, split: str = NQ_VALIDATION_SPLIT, max_doc_words: int = MAX_DOC_WORDS) -> list[dict]:
     """
     Load N examples from Natural Questions.
     Each example: {'question': str, 'document_text': str, 'has_answer': bool}
@@ -276,25 +278,31 @@ def load_nq_examples(n: int = 100, split: str = NQ_VALIDATION_SPLIT) -> list[dic
         "google-research-datasets/natural_questions",
         split=split,
         streaming=True,
-        trust_remote_code=True,
     )
 
     examples = []
     for row in ds:
         question = row["question"]["text"]
 
-        # Extract plain document text from token list
+        # Extract plain document text — tokens are parallel lists
         doc_tokens = row["document"]["tokens"]
+        token_list = doc_tokens["token"]
+        is_html_list = doc_tokens["is_html"]
         plain_words = [
-            t["token"] for t in doc_tokens if not t.get("is_html", False)
+            tok for tok, is_html in zip(token_list, is_html_list)
+            if not is_html
         ]
+        if max_doc_words:
+            plain_words = plain_words[:max_doc_words]
         document_text = " ".join(plain_words)
 
         # Ground truth: does this document contain a long answer?
+        # annotations fields are also parallel lists
         annotations = row["annotations"]
+        long_answers = annotations["long_answer"]
         has_answer = any(
-            ann["long_answer"]["start_token"] >= 0
-            for ann in annotations
+            la["start_token"] >= 0
+            for la in long_answers
         )
 
         examples.append({
@@ -415,8 +423,12 @@ def main():
         help="BERT cosine similarity threshold for pruning (default: 0.55)",
     )
     parser.add_argument(
-        "--llama-model", type=str, default=DEFAULT_LLAMA_MODEL,
-        help="HuggingFace model ID for Llama",
+        "--llama-model", type=str, default=None,
+        help="HuggingFace model ID for Llama (overrides --tiny)",
+    )
+    parser.add_argument(
+        "--tiny", action="store_true",
+        help="Use TinyLlama instead of Llama (no auth required)",
     )
     parser.add_argument(
         "--modes", nargs="+", default=["full", "bert", "random"],
@@ -428,6 +440,10 @@ def main():
         help="Path to write JSON results",
     )
     parser.add_argument(
+        "--max-doc-words", type=int, default=MAX_DOC_WORDS,
+        help="Truncate documents to this many words (default: 500, 0=no limit)",
+    )
+    parser.add_argument(
         "--seed", type=int, default=42,
         help="Random seed",
     )
@@ -437,15 +453,26 @@ def main():
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
 
+    # Resolve model: --llama-model overrides --tiny, default is Llama
+    if args.llama_model:
+        llm_model = args.llama_model
+    elif args.tiny:
+        llm_model = TINYLLAMA_MODEL
+    else:
+        llm_model = DEFAULT_LLAMA_MODEL
+
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"[Device] Using: {device}")
+    print(f"[LLM]   Model: {llm_model}")
 
     # Load models
     embedder = BertEmbedder(device=device)
-    classifier = LlamaClassifier(model_name=args.llama_model, device=device)
+    classifier = LlamaClassifier(model_name=llm_model, device=device)
 
     # Load data
-    examples = load_nq_examples(n=args.n, split=args.split)
+    examples = load_nq_examples(
+        n=args.n, split=args.split, max_doc_words=args.max_doc_words or None,
+    )
 
     # Run all requested modes and collect results
     all_results = []
