@@ -24,7 +24,7 @@ Estimated relevance score: `es = LLM_score × BERT_similarity`
 ### Prerequisites
 
 - Python 3.10+
-- A [HuggingFace](https://huggingface.co/) account with access to the Llama model
+- A [HuggingFace](https://huggingface.co/) account
 
 ### Install dependencies
 
@@ -32,17 +32,31 @@ Estimated relevance score: `es = LLM_score × BERT_similarity`
 pip install -r requirements.txt
 ```
 
-### Authenticate with HuggingFace
+### Authenticate with HuggingFace (required for Llama)
 
-You need to accept the [Llama license](https://huggingface.co/meta-llama/Llama-3.2-1B-Instruct) on HuggingFace, then log in:
+If using Llama (the default), you need to:
+
+1. Create a HuggingFace account at https://huggingface.co/
+2. Go to https://huggingface.co/meta-llama/Llama-3.2-1B-Instruct and accept the license
+3. Create an access token at https://huggingface.co/settings/tokens
+4. Log in from your terminal:
 
 ```bash
+pip install huggingface_hub
 huggingface-cli login
 ```
 
+If you're using TinyLlama (`--tiny` flag), no authentication is needed.
+
 ## Usage
 
-### Basic run (50 examples, all 3 modes)
+### Quick start with TinyLlama (no auth required)
+
+```bash
+python classify_nq.py --tiny --n 20
+```
+
+### Run with Llama (requires HuggingFace auth)
 
 ```bash
 python classify_nq.py --n 50
@@ -51,13 +65,13 @@ python classify_nq.py --n 50
 ### Custom threshold and modes
 
 ```bash
-python classify_nq.py --n 100 --threshold 0.60 --modes bert random
+python classify_nq.py --tiny --n 100 --threshold 0.60 --modes bert random
 ```
 
-### Specify a different Llama model
+### Faster CPU testing (truncate long documents)
 
 ```bash
-python classify_nq.py --llama-model meta-llama/Llama-3.2-1B-Instruct --n 20
+python classify_nq.py --tiny --n 10 --max-doc-words 200
 ```
 
 ### All options
@@ -68,7 +82,9 @@ python classify_nq.py --llama-model meta-llama/Llama-3.2-1B-Instruct --n 20
 | `--n` | `50` | Number of NQ examples to evaluate |
 | `--split` | `validation` | NQ dataset split (`train` or `validation`) |
 | `--threshold` | `0.55` | BERT cosine similarity cutoff for pruning |
-| `--llama-model` | `meta-llama/Llama-3.2-1B-Instruct` | HuggingFace model ID |
+| `--tiny` | off | Use TinyLlama instead of Llama (no auth required) |
+| `--llama-model` | `meta-llama/Llama-3.2-1B-Instruct` | HuggingFace model ID (overrides `--tiny`) |
+| `--max-doc-words` | `500` | Truncate documents to N words (0 = no limit) |
 | `--modes` | `full bert random` | Evaluation modes to run |
 | `--output` | `results.json` | Path for JSON results |
 | `--seed` | `42` | Random seed |
@@ -89,6 +105,7 @@ Results are printed as a summary table and saved to `results.json`.
 
 ## Notes
 
+- **TinyLlama vs Llama**: Use `--tiny` for quick testing without auth. For final results, use Llama (the default) which requires HuggingFace authentication and license acceptance.
 - On GPU the script uses 4-bit quantization (via `bitsandbytes`) to fit Llama in VRAM.
-- On CPU it runs in fp32 — use a small model (e.g., `Llama-3.2-1B-Instruct`) and a low `--n` for testing.
+- On CPU it runs in fp32 — use `--tiny` and `--max-doc-words 200` for faster iteration.
 - The Natural Questions dataset streams from HuggingFace so no manual download is needed.
