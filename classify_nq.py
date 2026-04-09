@@ -20,7 +20,6 @@ Evaluation compares three modes:
 import argparse
 import json
 import random
-import re
 import time
 from dataclasses import dataclass, field
 from typing import Optional
@@ -29,10 +28,9 @@ import numpy as np
 import torch
 from datasets import load_dataset
 from transformers import (
-    AutoTokenizer as BertAutoTokenizer,
+    AutoTokenizer,
     AutoModel,
     AutoModelForCausalLM,
-    AutoTokenizer as LlamaAutoTokenizer,
     pipeline,
     BitsAndBytesConfig,
 )
@@ -46,7 +44,8 @@ DEFAULT_LLAMA_MODEL = "meta-llama/Llama-3.2-1B-Instruct"
 TINYLLAMA_MODEL = "TinyLlama/TinyLlama-1.1B-Chat-v1.0"
 BERT_MODEL = "bert-base-uncased"
 SIMILARITY_THRESHOLD = 0.55   # cosine similarity gate for pruning
-MAX_CHUNK_TOKENS = 256         # tokens per chunk when recursing
+MAX_CHUNK_WORDS = 256          # words per chunk when recursing
+CHUNK_OVERLAP_WORDS = 50       # sliding window overlap between chunks
 MIN_CHUNK_WORDS = 20           # stop recursing when chunk is this small
 MAX_RECURSION_DEPTH = 3
 MAX_DOC_WORDS = 500           # truncate documents for faster runs
@@ -64,7 +63,7 @@ class TextNode:
     depth: int = 0
     children: list = field(default_factory=list)
     llm_label: Optional[str] = None
-    bert_score: float = 0.0
+    bert_score: Optional[float] = None
     was_pruned: bool = False
 
 
@@ -84,14 +83,14 @@ class RunStats:
 class BertEmbedder:
     def __init__(self, model_name: str = BERT_MODEL, device: str = "cpu"):
         print(f"[BERT] Loading {model_name} ...")
-        self.tokenizer = BertAutoTokenizer.from_pretrained(model_name)
+        self.tokenizer = AutoTokenizer.from_pretrained(model_name)
         self.model = AutoModel.from_pretrained(model_name).to(device)
         self.model.eval()
         self.device = device
 
     @torch.no_grad()
     def embed(self, texts: list[str]) -> np.ndarray:
-        """Return mean-pooled CLS embeddings, shape (N, hidden_size)."""
+        """Return mean-pooled embeddings, shape (N, hidden_size)."""
         enc = self.tokenizer(
             texts,
             padding=True,
@@ -140,7 +139,7 @@ class LlamaClassifier:
                 device_map="cpu",
             )
 
-        self.tokenizer = LlamaAutoTokenizer.from_pretrained(model_name)
+        self.tokenizer = AutoTokenizer.from_pretrained(model_name)
         self.pipe = pipeline(
             "text-generation",
             model=model,
@@ -182,15 +181,22 @@ class LlamaClassifier:
 # Text chunking
 # ---------------------------------------------------------------------------
 
-def split_into_chunks(text: str, max_words: int = MAX_CHUNK_TOKENS) -> list[str]:
-    """Split text into word-based chunks of at most max_words words."""
+def split_into_chunks(
+    text: str,
+    max_words: int = MAX_CHUNK_WORDS,
+    overlap: int = CHUNK_OVERLAP_WORDS,
+) -> list[str]:
+    """Split text into word-based chunks with a sliding window overlap."""
     words = text.split()
     if len(words) <= max_words:
         return [text]
+    step = max(1, max_words - overlap)
     chunks = []
-    for i in range(0, len(words), max_words):
+    for i in range(0, len(words), step):
         chunk = " ".join(words[i : i + max_words])
         chunks.append(chunk)
+        if i + max_words >= len(words):
+            break
     return chunks
 
 
@@ -210,8 +216,8 @@ def extract_plain_text(document: dict) -> str:
 
 def classify_node_recursive(
     node: TextNode,
-    query: str,
-    query_embedding: np.ndarray,
+    question: str,
+    bert_query_embedding: np.ndarray,
     embedder: BertEmbedder,
     classifier: LlamaClassifier,
     stats: RunStats,
@@ -222,17 +228,25 @@ def classify_node_recursive(
     """
     Recursively classify a TextNode.
     Returns 'yes' or 'no'.
+
+    question: the actual NQ question (e.g. "who played batman in the dark
+        knight") — used for both LLM classification and BERT similarity.
+    bert_query_embedding: pre-computed BERT embedding of `question`.
     """
     stats.total_nodes += 1
     text = node.text.strip()
 
     # --- Gating step ---
+    # In "bert" mode, the parent may have already batch-scored this node.
+    # If bert_score is still None we need to compute it (root node case).
     if mode == "bert":
-        emb = embedder.embed([text])
-        stats.bert_calls += 1
-        sim = float(embedder.cosine_similarity(query_embedding, emb)[0])
-        node.bert_score = sim
-        if sim < threshold:
+        if node.bert_score is None:
+            emb = embedder.embed([text])
+            stats.bert_calls += 1
+            node.bert_score = float(
+                embedder.cosine_similarity(bert_query_embedding, emb)[0]
+            )
+        if node.bert_score < threshold:
             node.was_pruned = True
             stats.pruned_nodes += 1
             return "no"
@@ -246,19 +260,28 @@ def classify_node_recursive(
     # --- Base case: small enough to call LLM ---
     words = text.split()
     if len(words) <= MIN_CHUNK_WORDS or node.depth >= MAX_RECURSION_DEPTH:
-        label = classifier.classify(query, text)
+        label = classifier.classify(question, text)
         stats.llm_calls += 1
         node.llm_label = label
         return label
 
     # --- Recurse: split into chunks ---
-    chunks = split_into_chunks(text, max_words=MAX_CHUNK_TOKENS)
+    chunks = split_into_chunks(text, max_words=MAX_CHUNK_WORDS)
+    children = [TextNode(text=ct, depth=node.depth + 1) for ct in chunks]
+    node.children = children
+
+    # Batch BERT scoring for all children in one forward pass
+    if mode == "bert":
+        child_embs = embedder.embed([c.text for c in children])
+        stats.bert_calls += len(children)
+        sims = embedder.cosine_similarity(bert_query_embedding, child_embs)
+        for child, sim in zip(children, sims):
+            child.bert_score = float(sim)
+
     child_labels = []
-    for chunk_text in chunks:
-        child = TextNode(text=chunk_text, depth=node.depth + 1)
-        node.children.append(child)
+    for child in children:
         label = classify_node_recursive(
-            child, query, query_embedding, embedder,
+            child, question, bert_query_embedding, embedder,
             classifier, stats, threshold, mode, prune_rate,
         )
         child_labels.append(label)
@@ -330,37 +353,42 @@ def load_nq_examples(n: int = 100, split: str = NQ_VALIDATION_SPLIT, max_doc_wor
 
 def run_evaluation(
     examples: list[dict],
-    query: str,
+    question_embeddings: np.ndarray,
     embedder: BertEmbedder,
     classifier: LlamaClassifier,
     mode: str,
     threshold: float = SIMILARITY_THRESHOLD,
+    prune_rate: float = 0.0,
 ) -> dict:
     """
     Run classification on all examples under the given mode.
+
+    question_embeddings: shape (N, hidden_size), pre-computed BERT embeddings
+        of the actual NQ questions (one per example).
+    prune_rate: for 'random' mode, the fraction of nodes to prune. Should be
+        set to the actual rate observed from a prior 'bert' run.
+
     Returns a results dict with predictions, ground truth, and stats.
     """
     print(f"\n{'='*60}")
     print(f" Mode: {mode.upper()}")
+    if mode == "random":
+        print(f" Prune rate: {prune_rate:.3f}")
     print(f"{'='*60}")
 
     stats = RunStats()
     t0 = time.time()
 
-    # Pre-compute query embedding once (used by all modes, but gating only in bert)
-    query_embedding = embedder.embed([query])
-
-    # Estimate prune_rate for random mode to match bert's pruning rate
-    # We'll compute it after a dry bert run, or set it statically here
-    prune_rate = 1.0 - threshold  # rough proxy
-
     predictions = []
     ground_truths = []
 
     for i, ex in enumerate(examples):
+        # Use the actual question's BERT embedding for similarity scoring
+        q_emb = question_embeddings[i : i + 1]  # shape (1, hidden_size)
+
         root = TextNode(text=ex["document_text"], depth=0)
         label = classify_node_recursive(
-            root, query, query_embedding, embedder,
+            root, ex["question"], q_emb, embedder,
             classifier, stats, threshold, mode, prune_rate,
         )
         predictions.append(label)
@@ -409,10 +437,9 @@ def main():
         description="BERT-Augmented LLM classification on Natural Questions"
     )
     parser.add_argument(
-        "--query",
-        type=str,
-        default="Does this passage contain a direct answer to the question?",
-        help="Classification query / prompt sent to the LLM",
+        "--query", type=str, default=None,
+        help="(Deprecated — ignored. The actual NQ question is now used "
+             "automatically for both BERT gating and LLM classification.)",
     )
     parser.add_argument(
         "--n", type=int, default=50,
@@ -479,17 +506,42 @@ def main():
         n=args.n, split=args.split, max_doc_words=args.max_doc_words or None,
     )
 
+    # Pre-compute question embeddings once (reused across all modes)
+    print("[BERT] Pre-computing question embeddings ...")
+    questions = [ex["question"] for ex in examples]
+    # Batch in groups of 64 to avoid OOM on large N
+    q_batches = [
+        embedder.embed(questions[i : i + 64])
+        for i in range(0, len(questions), 64)
+    ]
+    question_embeddings = np.concatenate(q_batches, axis=0)
+
+    # Ensure bert runs before random so we can use the actual prune rate
+    modes = list(args.modes)
+    if "bert" in modes and "random" in modes:
+        modes.sort(key=lambda m: 0 if m == "full" else (1 if m == "bert" else 2))
+
     # Run all requested modes and collect results
     all_results = []
-    for mode in args.modes:
+    # Use actual bert prune rate when available; fall back to 1-threshold
+    bert_prune_rate = 1.0 - args.threshold if "bert" not in modes else 0.0
+    for mode in modes:
         result = run_evaluation(
             examples=examples,
-            query=args.query,
+            question_embeddings=question_embeddings,
             embedder=embedder,
             classifier=classifier,
             mode=mode,
             threshold=args.threshold,
+            prune_rate=bert_prune_rate,
         )
+        # Record actual prune rate from bert run for use by random
+        if mode == "bert":
+            s = result["stats"]
+            bert_prune_rate = (
+                s.pruned_nodes / s.total_nodes if s.total_nodes > 0 else 0.0
+            )
+            print(f"  [bert] Actual prune rate: {bert_prune_rate:.3f}")
         print_results(result)
         all_results.append(result)
 
