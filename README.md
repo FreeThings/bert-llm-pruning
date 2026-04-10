@@ -78,8 +78,8 @@ python classify_nq.py --tiny --n 10 --max-doc-words 200
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--query` | `"Does this passage contain a direct answer to the question?"` | Classification prompt sent to the LLM |
 | `--n` | `50` | Number of NQ examples to evaluate |
+| `--local-data` | — | Path to local JSON of pre-downloaded NQ examples (skips streaming) |
 | `--split` | `validation` | NQ dataset split (`train` or `validation`) |
 | `--threshold` | `0.55` | BERT cosine similarity cutoff for pruning |
 | `--tiny` | off | Use TinyLlama instead of Llama (no auth required) |
@@ -103,9 +103,23 @@ Metrics reported: accuracy, precision, recall, F1, total LLM calls, BERT calls, 
 
 Results are printed as a summary table and saved to `results.json`.
 
+## Local test data
+
+Streaming NQ from HuggingFace can be slow. To avoid this, download a sample once and reuse it:
+
+```bash
+# Download 50 examples to test_data/nq_sample_50.json (one-time, takes a few minutes)
+python test_data/download_nq_sample.py --n 50
+
+# Run using the local data (instant loading)
+python classify_nq.py --tiny --local-data test_data/nq_sample_50.json --modes bert random
+```
+
+The download script accepts `--n`, `--split`, `--max-doc-words`, and `--seed` flags.
+
 ## Notes
 
 - **TinyLlama vs Llama**: Use `--tiny` for quick testing without auth. For final results, use Llama (the default) which requires HuggingFace authentication and license acceptance.
 - On GPU the script uses 4-bit quantization (via `bitsandbytes`) to fit Llama in VRAM.
 - On CPU it runs in fp32 — use `--tiny` and `--max-doc-words 200` for faster iteration.
-- The Natural Questions dataset streams from HuggingFace so no manual download is needed.
+- The Natural Questions dataset streams from HuggingFace so no manual download is needed, but `--local-data` is recommended for faster iteration (see above).

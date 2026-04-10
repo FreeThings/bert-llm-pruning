@@ -298,7 +298,7 @@ def classify_node_recursive(
 
 def load_nq_examples(n: int = 100, split: str = NQ_VALIDATION_SPLIT, max_doc_words: int = MAX_DOC_WORDS) -> list[dict]:
     """
-    Load N examples from Natural Questions.
+    Load N examples from Natural Questions (streams from HuggingFace).
     Each example: {'question': str, 'document_text': str, 'has_answer': bool}
     """
     print(f"[NQ] Loading Natural Questions ({split} split, first {n} examples) ...")
@@ -342,6 +342,21 @@ def load_nq_examples(n: int = 100, split: str = NQ_VALIDATION_SPLIT, max_doc_wor
         if len(examples) >= n:
             break
 
+    print(f"[NQ] Loaded {len(examples)} examples "
+          f"({sum(e['has_answer'] for e in examples)} with answers)")
+    return examples
+
+
+def load_local_examples(path: str, n: int = 0) -> list[dict]:
+    """
+    Load pre-downloaded examples from a local JSON file.
+    Use test_data/download_nq_sample.py to generate the file.
+    """
+    print(f"[NQ] Loading local data from {path} ...")
+    with open(path) as f:
+        examples = json.load(f)
+    if n:
+        examples = examples[:n]
     print(f"[NQ] Loaded {len(examples)} examples "
           f"({sum(e['has_answer'] for e in examples)} with answers)")
     return examples
@@ -476,6 +491,11 @@ def main():
         help="Truncate documents to this many words (default: 500, 0=no limit)",
     )
     parser.add_argument(
+        "--local-data", type=str, default=None,
+        help="Path to a local JSON file of pre-downloaded NQ examples "
+             "(see test_data/download_nq_sample.py)",
+    )
+    parser.add_argument(
         "--seed", type=int, default=42,
         help="Random seed",
     )
@@ -502,9 +522,12 @@ def main():
     classifier = LlamaClassifier(model_name=llm_model, device=device)
 
     # Load data
-    examples = load_nq_examples(
-        n=args.n, split=args.split, max_doc_words=args.max_doc_words or None,
-    )
+    if args.local_data:
+        examples = load_local_examples(args.local_data, n=args.n)
+    else:
+        examples = load_nq_examples(
+            n=args.n, split=args.split, max_doc_words=args.max_doc_words or None,
+        )
 
     # Pre-compute question embeddings once (reused across all modes)
     print("[BERT] Pre-computing question embeddings ...")
