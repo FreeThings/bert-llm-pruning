@@ -2,14 +2,15 @@
 BERT-Augmented LLM Text Classification on Natural Questions
 CS4964 Final Project — Greenbaum, McFarland, DeBoer
 
-Algorithm:
-  1. Load NQ dataset and a user-supplied query (classification prompt)
-  2. Compute BERT embeddings for all candidate documents
-  3. Score each document by cosine similarity to the query embedding
-  4. Prune low-similarity documents
-  5. Recursively split remaining docs into chunks, prune again
-  6. Call Llama only on the surviving high-similarity chunks
-  7. Aggregate chunk results to produce a per-document label
+Algorithm (gate-then-chunk with depth-scaled thresholds):
+  1. Load NQ dataset
+  2. Split each document into BERT-max windows (~380 words)
+     (BERT can only see 512 tokens, so scoring full docs is unreliable)
+  3. BERT-score each window against the query, prune below threshold
+  4. Split survivors into paragraphs, score and prune (tighter threshold)
+  5. Surviving leaf chunks sent to Llama
+  6. Aggregate: soft (weight by BERT score) or hard (any yes = yes)
+  Threshold scales with depth: τ(d) = base + d * step
 
 Evaluation compares three modes:
   - full    : LLM called on every document (no pruning)
@@ -43,12 +44,20 @@ from sklearn.metrics import classification_report
 DEFAULT_LLAMA_MODEL = "meta-llama/Llama-3.2-1B-Instruct"
 TINYLLAMA_MODEL = "TinyLlama/TinyLlama-1.1B-Chat-v1.0"
 BERT_MODEL = "bert-base-uncased"
-SIMILARITY_THRESHOLD = 0.55   # cosine similarity gate for pruning
-MAX_CHUNK_WORDS = 256          # words per chunk when recursing
-CHUNK_OVERLAP_WORDS = 50       # sliding window overlap between chunks
-MIN_CHUNK_WORDS = 20           # stop recursing when chunk is this small
+SIMILARITY_THRESHOLD = 0.40   # base cosine similarity gate for pruning
+THRESHOLD_STEP = 0.10         # increase threshold by this much per depth level
+BERT_MAX_WORDS = 380           # ~512 tokens — max BERT can actually see
+MIN_CHUNK_WORDS = 40           # stop recursing — "few sentences" leaf size
 MAX_RECURSION_DEPTH = 3
-MAX_DOC_WORDS = 500           # truncate documents for faster runs
+MAX_DOC_WORDS = 0             # 0 = no truncation (use full document length)
+DOC_SCORE_THRESHOLD = 0.35    # soft aggregation: min bert_score for a "yes" chunk to count
+
+# Chunk sizes per depth level — defines the funnel shape
+# depth 0 (doc):               split into BERT-max windows (~380 words)
+# depth 1 (BERT-max windows):  gate, then split survivors into paragraphs
+# depth 2 (paragraphs):        gate, then leaf → hits LLM
+CHUNK_WORDS_BY_DEPTH = [BERT_MAX_WORDS, 150, 40]
+CHUNK_OVERLAP_WORDS = 20       # sliding window overlap between chunks
 NQ_TRAIN_SPLIT = "train"
 NQ_VALIDATION_SPLIT = "validation"
 
@@ -181,9 +190,16 @@ class LlamaClassifier:
 # Text chunking
 # ---------------------------------------------------------------------------
 
+def get_chunk_size_for_depth(depth: int) -> int:
+    """Return the target chunk size (in words) for children at the given depth."""
+    if depth < len(CHUNK_WORDS_BY_DEPTH):
+        return CHUNK_WORDS_BY_DEPTH[depth]
+    return MIN_CHUNK_WORDS
+
+
 def split_into_chunks(
     text: str,
-    max_words: int = MAX_CHUNK_WORDS,
+    max_words: int,
     overlap: int = CHUNK_OVERLAP_WORDS,
 ) -> list[str]:
     """Split text into word-based chunks with a sliding window overlap."""
@@ -200,16 +216,6 @@ def split_into_chunks(
     return chunks
 
 
-def extract_plain_text(document: dict) -> str:
-    """
-    Extract non-HTML tokens from an NQ document dict.
-    The NQ `document` field has {'tokens': [{'token': str, 'is_html': bool}, ...]}.
-    """
-    tokens = document.get("tokens", [])
-    words = [t["token"] for t in tokens if not t.get("is_html", False)]
-    return " ".join(words)
-
-
 # ---------------------------------------------------------------------------
 # Core recursive classification
 # ---------------------------------------------------------------------------
@@ -221,75 +227,123 @@ def classify_node_recursive(
     embedder: BertEmbedder,
     classifier: LlamaClassifier,
     stats: RunStats,
-    threshold: float,
+    base_threshold: float,
+    threshold_step: float,
     mode: str,          # "full" | "bert" | "random"
     prune_rate: float = 0.0,  # used only by "random" mode
-) -> str:
+    aggregation: str = "soft",  # "soft" or "hard"
+    doc_score_threshold: float = DOC_SCORE_THRESHOLD,
+    gates_passed: int = 0,  # how many BERT gates ancestors have passed through
+) -> tuple[str, float]:
     """
-    Recursively classify a TextNode.
-    Returns 'yes' or 'no'.
+    Recursive classifier with depth-scaled BERT gating.
 
-    question: the actual NQ question (e.g. "who played batman in the dark
-        knight") — used for both LLM classification and BERT similarity.
-    bert_query_embedding: pre-computed BERT embedding of `question`.
+    Gate-then-chunk: at every level, BERT scores the current node first.
+    If it fails the threshold, the entire subtree is pruned — no chunking,
+    no children, no LLM calls.  This is where the cost savings come from:
+    killing whole branches early.
+
+    The threshold tightens at each depth level:
+        threshold(depth) = base_threshold + depth * threshold_step
+
+    Depth 0 (document):          too large for BERT — skip gate, just chunk
+    Depth 1 (BERT-max windows):  τ = base — first real gate, prune whole branches
+    Depth 2 (paragraphs):        τ = base + step — tighter
+    Depth 3+ (sentences):        τ = base + 2*step — strictest, leaf → LLM
+
+    Returns (label, estimated_score):
+      - label: 'yes' or 'no'
+      - estimated_score: best (bert_score * llm_yes) across surviving chunks
     """
     stats.total_nodes += 1
     text = node.text.strip()
-
-    # --- Gating step ---
-    # In "bert" mode, the parent may have already batch-scored this node.
-    # If bert_score is still None we need to compute it (root node case).
-    if mode == "bert":
-        if node.bert_score is None:
-            emb = embedder.embed([text])
-            stats.bert_calls += 1
-            node.bert_score = float(
-                embedder.cosine_similarity(bert_query_embedding, emb)[0]
-            )
-        if node.bert_score < threshold:
-            node.was_pruned = True
-            stats.pruned_nodes += 1
-            return "no"
-
-    elif mode == "random":
-        if random.random() < prune_rate:
-            node.was_pruned = True
-            stats.pruned_nodes += 1
-            return "no"
-
-    # --- Base case: small enough to call LLM ---
     words = text.split()
+
+    # Skip the BERT gate if the text exceeds BERT's window — the embedding
+    # would only see the first ~380 words, making the score unreliable.
+    # Just chunk it down to BERT-max size and gate the children instead.
+    is_oversized = len(words) > BERT_MAX_WORDS
+    depth_threshold = base_threshold + gates_passed * threshold_step
+
+    # --- Gate: BERT scores this node BEFORE we chunk or call LLM ---
+    if not is_oversized:
+        if mode == "bert":
+            if node.bert_score is None:
+                emb = embedder.embed([text])
+                stats.bert_calls += 1
+                node.bert_score = float(
+                    embedder.cosine_similarity(bert_query_embedding, emb)[0]
+                )
+            if node.bert_score < depth_threshold:
+                node.was_pruned = True
+                stats.pruned_nodes += 1
+                return "no", 0.0
+        elif mode == "random":
+            if random.random() < prune_rate:
+                node.was_pruned = True
+                stats.pruned_nodes += 1
+                return "no", 0.0
+        gates_passed += 1
+
+    # --- Base case: small enough to send to LLM ---
     if len(words) <= MIN_CHUNK_WORDS or node.depth >= MAX_RECURSION_DEPTH:
         label = classifier.classify(question, text)
         stats.llm_calls += 1
         node.llm_label = label
-        return label
+        score = (node.bert_score or 0.0) if label == "yes" else 0.0
+        return label, score
 
-    # --- Recurse: split into chunks ---
-    chunks = split_into_chunks(text, max_words=MAX_CHUNK_WORDS)
+    # --- Recurse: split into depth-appropriate chunks ---
+    child_chunk_size = get_chunk_size_for_depth(node.depth)
+    chunks = split_into_chunks(text, max_words=child_chunk_size)
+
+    # If splitting produced a single chunk (text already smaller than chunk
+    # size), don't create an identical child — that would waste a BERT call
+    # and apply a stricter threshold to unchanged text.  Treat as a leaf.
+    if len(chunks) == 1:
+        label = classifier.classify(question, text)
+        stats.llm_calls += 1
+        node.llm_label = label
+        score = (node.bert_score or 0.0) if label == "yes" else 0.0
+        return label, score
+
     children = [TextNode(text=ct, depth=node.depth + 1) for ct in chunks]
     node.children = children
 
-    # Batch BERT scoring for all children in one forward pass
+    # Batch BERT scoring for children (batch in groups of 32 to avoid OOM)
     if mode == "bert":
-        child_embs = embedder.embed([c.text for c in children])
+        child_texts = [c.text for c in children]
+        emb_batches = [
+            embedder.embed(child_texts[i : i + 32])
+            for i in range(0, len(child_texts), 32)
+        ]
+        child_embs = np.concatenate(emb_batches, axis=0)
         stats.bert_calls += len(children)
         sims = embedder.cosine_similarity(bert_query_embedding, child_embs)
         for child, sim in zip(children, sims):
             child.bert_score = float(sim)
 
+    child_scores = []
     child_labels = []
     for child in children:
-        label = classify_node_recursive(
+        label, score = classify_node_recursive(
             child, question, bert_query_embedding, embedder,
-            classifier, stats, threshold, mode, prune_rate,
+            classifier, stats, base_threshold, threshold_step,
+            mode, prune_rate, aggregation, doc_score_threshold, gates_passed,
         )
         child_labels.append(label)
+        child_scores.append(score)
 
-    # A document is 'yes' if any surviving chunk is 'yes'
-    result = "yes" if "yes" in child_labels else "no"
+    # --- Aggregation ---
+    best_score = max(child_scores) if child_scores else 0.0
+
+    if aggregation == "soft":
+        result = "yes" if best_score > doc_score_threshold else "no"
+    else:
+        result = "yes" if "yes" in child_labels else "no"
+
     node.llm_label = result
-    return result
+    return result, best_score
 
 
 # ---------------------------------------------------------------------------
@@ -373,7 +427,10 @@ def run_evaluation(
     classifier: LlamaClassifier,
     mode: str,
     threshold: float = SIMILARITY_THRESHOLD,
+    threshold_step: float = THRESHOLD_STEP,
     prune_rate: float = 0.0,
+    aggregation: str = "soft",
+    doc_score_threshold: float = DOC_SCORE_THRESHOLD,
 ) -> dict:
     """
     Run classification on all examples under the given mode.
@@ -382,11 +439,16 @@ def run_evaluation(
         of the actual NQ questions (one per example).
     prune_rate: for 'random' mode, the fraction of nodes to prune. Should be
         set to the actual rate observed from a prior 'bert' run.
+    threshold_step: how much to increase threshold per recursion depth.
+    aggregation: 'soft' (weight by bert score) or 'hard' (any yes = yes).
 
     Returns a results dict with predictions, ground truth, and stats.
     """
     print(f"\n{'='*60}")
     print(f" Mode: {mode.upper()}")
+    if mode == "bert":
+        print(f" Base threshold: {threshold:.3f}, step: {threshold_step:.3f}")
+        print(f" Aggregation: {aggregation}")
     if mode == "random":
         print(f" Prune rate: {prune_rate:.3f}")
     print(f"{'='*60}")
@@ -402,9 +464,10 @@ def run_evaluation(
         q_emb = question_embeddings[i : i + 1]  # shape (1, hidden_size)
 
         root = TextNode(text=ex["document_text"], depth=0)
-        label = classify_node_recursive(
+        label, _score = classify_node_recursive(
             root, ex["question"], q_emb, embedder,
-            classifier, stats, threshold, mode, prune_rate,
+            classifier, stats, threshold, threshold_step,
+            mode, prune_rate, aggregation, doc_score_threshold,
         )
         predictions.append(label)
         ground_truths.append("yes" if ex["has_answer"] else "no")
@@ -426,6 +489,214 @@ def run_evaluation(
         "ground_truths": ground_truths,
         "classification_report": report,
     }
+
+
+# ---------------------------------------------------------------------------
+# Threshold tuning
+# ---------------------------------------------------------------------------
+
+def serialize_tree(node: TextNode) -> dict:
+    """Serialize a scored tree into a dict for threshold replay."""
+    return {
+        "bert_score": node.bert_score,
+        "llm_label": node.llm_label,
+        "depth": node.depth,
+        "is_leaf": len(node.children) == 0,
+        "children": [serialize_tree(c) for c in node.children],
+    }
+
+
+def replay_tree(node_data: dict, base_threshold: float, threshold_step: float,
+                doc_score_threshold: float, gates_passed: int = 0) -> tuple[str, float, int]:
+    """
+    Simulate pruning on a pre-scored tree node. Returns (label, score, llm_calls).
+    No model calls — just replays the threshold logic on cached scores.
+    """
+    bert_score = node_data["bert_score"]
+    depth_threshold = base_threshold + gates_passed * threshold_step
+
+    # Gate: only if BERT could score this node (not oversized)
+    if bert_score is not None:
+        if bert_score < depth_threshold:
+            return "no", 0.0, 0
+        gates_passed += 1
+
+    # Leaf
+    if node_data["is_leaf"]:
+        label = node_data["llm_label"]
+        score = bert_score if (label == "yes" and bert_score is not None) else 0.0
+        return label, score, 1
+
+    # Recurse into children
+    child_scores = []
+    total_llm = 0
+    for child in node_data["children"]:
+        label, score, llm = replay_tree(
+            child, base_threshold, threshold_step, doc_score_threshold, gates_passed
+        )
+        child_scores.append(score)
+        total_llm += llm
+
+    best_score = max(child_scores) if child_scores else 0.0
+    result = "yes" if best_score > doc_score_threshold else "no"
+    return result, best_score, total_llm
+
+
+def run_tuning(
+    examples: list[dict],
+    question_embeddings: np.ndarray,
+    embedder: BertEmbedder,
+    classifier: LlamaClassifier,
+    train_split: float = 0.8,
+    seed: int = 42,
+) -> dict:
+    """
+    Tune thresholds using train/test split.
+
+    1. Split examples into train/test
+    2. Run full tree (no pruning) on train set to collect BERT scores + LLM labels
+    3. Sweep threshold combos on train trees (free — no model calls)
+    4. Pick best params by F1
+    5. Evaluate on test set with best params
+
+    Returns dict with best params and test results.
+    """
+    rng = random.Random(seed)
+
+    # --- Train/test split (stratified by has_answer) ---
+    pos = [i for i, e in enumerate(examples) if e["has_answer"]]
+    neg = [i for i, e in enumerate(examples) if not e["has_answer"]]
+    rng.shuffle(pos)
+    rng.shuffle(neg)
+
+    n_train_pos = max(1, int(len(pos) * train_split))
+    n_train_neg = max(1, int(len(neg) * train_split))
+
+    train_idx = set(pos[:n_train_pos] + neg[:n_train_neg])
+    test_idx = set(pos[n_train_pos:] + neg[n_train_neg:])
+
+    train_examples = [examples[i] for i in sorted(train_idx)]
+    test_examples = [examples[i] for i in sorted(test_idx)]
+    train_q_embs = np.array([question_embeddings[i] for i in sorted(train_idx)])
+    test_q_embs = np.array([question_embeddings[i] for i in sorted(test_idx)])
+
+    print(f"\n{'='*60}")
+    print(f" THRESHOLD TUNING")
+    print(f"{'='*60}")
+    print(f"  Train: {len(train_examples)} examples "
+          f"({sum(e['has_answer'] for e in train_examples)} with answers)")
+    print(f"  Test:  {len(test_examples)} examples "
+          f"({sum(e['has_answer'] for e in test_examples)} with answers)")
+
+    # --- Step 1: Run full trees on train set (expensive, but only once) ---
+    print("\n  [Tuning] Building full trees on training set (no pruning) ...")
+    train_trees = []
+    train_truths = []
+    stats = RunStats()
+    for i, ex in enumerate(train_examples):
+        q_emb = train_q_embs[i : i + 1]
+        root = TextNode(text=ex["document_text"], depth=0)
+        # Run in "full" mode to get LLM labels for every leaf
+        classify_node_recursive(
+            root, ex["question"], q_emb, embedder,
+            classifier, stats, 0.0, 0.0, "full",
+        )
+        # Now score every node with BERT (separate pass, no pruning)
+        _score_tree_bert(root, q_emb, embedder, stats)
+        train_trees.append(serialize_tree(root))
+        train_truths.append("yes" if ex["has_answer"] else "no")
+
+        if (i + 1) % 10 == 0:
+            print(f"    Processed {i+1}/{len(train_examples)} | "
+                  f"LLM calls: {stats.llm_calls}")
+
+    print(f"    Done. Total LLM calls: {stats.llm_calls}")
+
+    # --- Step 2: Grid search on train trees (free) ---
+    print("  [Tuning] Sweeping threshold parameters ...")
+    base_values = [round(x, 2) for x in np.arange(0.20, 0.65, 0.05)]
+    step_values = [round(x, 2) for x in np.arange(0.00, 0.25, 0.05)]
+    doc_thresh_values = [0.0, 0.20, 0.35, 0.50]
+
+    best_f1 = -1.0
+    best_params = {}
+    all_combos = []
+
+    for base in base_values:
+        for step in step_values:
+            for doc_thresh in doc_thresh_values:
+                preds = []
+                total_llm = 0
+                for tree, truth in zip(train_trees, train_truths):
+                    label, _score, llm = replay_tree(
+                        tree, base, step, doc_thresh
+                    )
+                    preds.append(label)
+                    total_llm += llm
+
+                report = classification_report(
+                    train_truths, preds, labels=["yes", "no"],
+                    output_dict=True, zero_division=0,
+                )
+                f1 = report["yes"]["f1-score"]
+                acc = report["accuracy"]
+                combo = {
+                    "base_threshold": base,
+                    "threshold_step": step,
+                    "doc_score_threshold": doc_thresh,
+                    "train_f1": f1,
+                    "train_accuracy": acc,
+                    "train_llm_calls": total_llm,
+                }
+                all_combos.append(combo)
+
+                if f1 > best_f1 or (f1 == best_f1 and total_llm < best_params.get("train_llm_calls", float("inf"))):
+                    best_f1 = f1
+                    best_params = combo
+
+    print(f"    Tested {len(all_combos)} combinations")
+    print(f"    Best train F1: {best_params['train_f1']:.3f} "
+          f"(acc: {best_params['train_accuracy']:.3f}, "
+          f"LLM calls: {best_params['train_llm_calls']})")
+    print(f"    Best params: base={best_params['base_threshold']:.2f}, "
+          f"step={best_params['threshold_step']:.2f}, "
+          f"doc_thresh={best_params['doc_score_threshold']:.2f}")
+
+    # --- Step 3: Evaluate on test set with best params ---
+    print(f"\n  [Tuning] Evaluating on test set with best params ...")
+    test_result = run_evaluation(
+        examples=test_examples,
+        question_embeddings=test_q_embs,
+        embedder=embedder,
+        classifier=classifier,
+        mode="bert",
+        threshold=best_params["base_threshold"],
+        threshold_step=best_params["threshold_step"],
+        doc_score_threshold=best_params["doc_score_threshold"],
+    )
+    print_results(test_result)
+
+    return {
+        "best_params": best_params,
+        "test_result": test_result,
+        "all_combos": all_combos,
+        "train_size": len(train_examples),
+        "test_size": len(test_examples),
+    }
+
+
+def _score_tree_bert(node: TextNode, query_emb: np.ndarray,
+                     embedder: BertEmbedder, stats: RunStats):
+    """Walk a tree and add BERT scores to every node that fits in BERT's window."""
+    words = node.text.strip().split()
+    if len(words) <= BERT_MAX_WORDS and node.bert_score is None:
+        emb = embedder.embed([node.text.strip()])
+        stats.bert_calls += 1
+        node.bert_score = float(
+            embedder.cosine_similarity(query_emb, emb)[0]
+        )
+    for child in node.children:
+        _score_tree_bert(child, query_emb, embedder, stats)
 
 
 def print_results(results: dict):
@@ -452,11 +723,6 @@ def main():
         description="BERT-Augmented LLM classification on Natural Questions"
     )
     parser.add_argument(
-        "--query", type=str, default=None,
-        help="(Deprecated — ignored. The actual NQ question is now used "
-             "automatically for both BERT gating and LLM classification.)",
-    )
-    parser.add_argument(
         "--n", type=int, default=50,
         help="Number of NQ examples to evaluate (default: 50)",
     )
@@ -467,7 +733,16 @@ def main():
     )
     parser.add_argument(
         "--threshold", type=float, default=SIMILARITY_THRESHOLD,
-        help="BERT cosine similarity threshold for pruning (default: 0.55)",
+        help="Base BERT cosine similarity threshold for pruning (default: 0.40)",
+    )
+    parser.add_argument(
+        "--threshold-step", type=float, default=THRESHOLD_STEP,
+        help="Threshold increase per recursion depth (default: 0.10)",
+    )
+    parser.add_argument(
+        "--aggregation", type=str, default="soft",
+        choices=["soft", "hard"],
+        help="Aggregation strategy: 'soft' (weight by BERT score) or 'hard' (any yes = yes)",
     )
     parser.add_argument(
         "--llama-model", type=str, default=None,
@@ -488,12 +763,20 @@ def main():
     )
     parser.add_argument(
         "--max-doc-words", type=int, default=MAX_DOC_WORDS,
-        help="Truncate documents to this many words (default: 500, 0=no limit)",
+        help="Truncate documents to this many words (default: 0=no limit)",
     )
     parser.add_argument(
         "--local-data", type=str, default=None,
         help="Path to a local JSON file of pre-downloaded NQ examples "
              "(see test_data/download_nq_sample.py)",
+    )
+    parser.add_argument(
+        "--tune", action="store_true",
+        help="Tune thresholds using 80/20 train/test split before evaluation",
+    )
+    parser.add_argument(
+        "--train-split", type=float, default=0.8,
+        help="Fraction of data for training during --tune (default: 0.8)",
     )
     parser.add_argument(
         "--seed", type=int, default=42,
@@ -539,6 +822,46 @@ def main():
     ]
     question_embeddings = np.concatenate(q_batches, axis=0)
 
+    # --- Threshold tuning ---
+    if args.tune:
+        tune_result = run_tuning(
+            examples=examples,
+            question_embeddings=question_embeddings,
+            embedder=embedder,
+            classifier=classifier,
+            train_split=args.train_split,
+            seed=args.seed,
+        )
+        # Apply tuned params to the main evaluation
+        best = tune_result["best_params"]
+        args.threshold = best["base_threshold"]
+        args.threshold_step = best["threshold_step"]
+        args.doc_score_threshold = best["doc_score_threshold"]
+        print(f"\n  [Tuning] Applying tuned params: "
+              f"base={args.threshold:.2f}, step={args.threshold_step:.2f}, "
+              f"doc_thresh={args.doc_score_threshold:.2f}")
+
+        # Save tuning results
+        tune_output = {
+            "best_params": best,
+            "test_accuracy": tune_result["test_result"]["classification_report"]["accuracy"],
+            "test_f1_yes": tune_result["test_result"]["classification_report"]["yes"]["f1-score"],
+            "train_size": tune_result["train_size"],
+            "test_size": tune_result["test_size"],
+            "top_10_combos": sorted(
+                tune_result["all_combos"],
+                key=lambda c: (-c["train_f1"], c["train_llm_calls"]),
+            )[:10],
+        }
+        tune_path = args.output.replace(".json", "_tuning.json")
+        with open(tune_path, "w") as f:
+            json.dump(tune_output, f, indent=2)
+        print(f"  [Tuning] Results saved to {tune_path}")
+
+    # Set default doc_score_threshold if not set by tuning
+    if not hasattr(args, "doc_score_threshold"):
+        args.doc_score_threshold = DOC_SCORE_THRESHOLD
+
     # Ensure bert runs before random so we can use the actual prune rate
     modes = list(args.modes)
     if "bert" in modes and "random" in modes:
@@ -556,7 +879,10 @@ def main():
             classifier=classifier,
             mode=mode,
             threshold=args.threshold,
+            threshold_step=args.threshold_step,
             prune_rate=bert_prune_rate,
+            aggregation=args.aggregation,
+            doc_score_threshold=args.doc_score_threshold,
         )
         # Record actual prune rate from bert run for use by random
         if mode == "bert":
