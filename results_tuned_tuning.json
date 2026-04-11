@@ -1,0 +1,96 @@
+{
+  "best_params": {
+    "base_threshold": 0.35,
+    "threshold_step": 0.2,
+    "doc_score_threshold": 0.5,
+    "train_f1": 0.8076923076923077,
+    "train_accuracy": 0.7435897435897436,
+    "train_llm_calls": 594
+  },
+  "test_accuracy": 0.5454545454545454,
+  "test_f1_yes": 0.5454545454545454,
+  "train_size": 39,
+  "test_size": 11,
+  "top_10_combos": [
+    {
+      "base_threshold": 0.35,
+      "threshold_step": 0.2,
+      "doc_score_threshold": 0.5,
+      "train_f1": 0.8076923076923077,
+      "train_accuracy": 0.7435897435897436,
+      "train_llm_calls": 594
+    },
+    {
+      "base_threshold": 0.35,
+      "threshold_step": 0.2,
+      "doc_score_threshold": 0.0,
+      "train_f1": 0.7924528301886793,
+      "train_accuracy": 0.717948717948718,
+      "train_llm_calls": 594
+    },
+    {
+      "base_threshold": 0.35,
+      "threshold_step": 0.2,
+      "doc_score_threshold": 0.2,
+      "train_f1": 0.7924528301886793,
+      "train_accuracy": 0.717948717948718,
+      "train_llm_calls": 594
+    },
+    {
+      "base_threshold": 0.35,
+      "threshold_step": 0.2,
+      "doc_score_threshold": 0.35,
+      "train_f1": 0.7924528301886793,
+      "train_accuracy": 0.717948717948718,
+      "train_llm_calls": 594
+    },
+    {
+      "base_threshold": 0.45,
+      "threshold_step": 0.15,
+      "doc_score_threshold": 0.0,
+      "train_f1": 0.7843137254901961,
+      "train_accuracy": 0.717948717948718,
+      "train_llm_calls": 590
+    },
+    {
+      "base_threshold": 0.45,
+      "threshold_step": 0.15,
+      "doc_score_threshold": 0.2,
+      "train_f1": 0.7843137254901961,
+      "train_accuracy": 0.717948717948718,
+      "train_llm_calls": 590
+    },
+    {
+      "base_threshold": 0.45,
+      "threshold_step": 0.15,
+      "doc_score_threshold": 0.35,
+      "train_f1": 0.7843137254901961,
+      "train_accuracy": 0.717948717948718,
+      "train_llm_calls": 590
+    },
+    {
+      "base_threshold": 0.45,
+      "threshold_step": 0.15,
+      "doc_score_threshold": 0.5,
+      "train_f1": 0.7843137254901961,
+      "train_accuracy": 0.717948717948718,
+      "train_llm_calls": 590
+    },
+    {
+      "base_threshold": 0.3,
+      "threshold_step": 0.2,
+      "doc_score_threshold": 0.0,
+      "train_f1": 0.7796610169491526,
+      "train_accuracy": 0.6666666666666666,
+      "train_llm_calls": 2269
+    },
+    {
+      "base_threshold": 0.3,
+      "threshold_step": 0.2,
+      "doc_score_threshold": 0.2,
+      "train_f1": 0.7796610169491526,
+      "train_accuracy": 0.6666666666666666,
+      "train_llm_calls": 2269
+    }
+  ]
+}

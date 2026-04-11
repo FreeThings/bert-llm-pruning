@@ -1,0 +1,26 @@
+[
+  {
+    "mode": "bert",
+    "llm_calls": 811,
+    "bert_calls": 22395,
+    "pruned_nodes": 17641,
+    "total_nodes": 22445,
+    "wall_time": 3098.4607260227203,
+    "accuracy": 0.7,
+    "f1_yes": 0.7619047619047619,
+    "precision_yes": 0.75,
+    "recall_yes": 0.7741935483870968
+  },
+  {
+    "mode": "random",
+    "llm_calls": 197,
+    "bert_calls": 0,
+    "pruned_nodes": 2147,
+    "total_nodes": 2761,
+    "wall_time": 314.3804910182953,
+    "accuracy": 0.38,
+    "f1_yes": 0.0,
+    "precision_yes": 0.0,
+    "recall_yes": 0.0
+  }
+]
