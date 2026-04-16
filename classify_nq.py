@@ -44,8 +44,8 @@ from sklearn.metrics import classification_report
 DEFAULT_LLAMA_MODEL = "meta-llama/Llama-3.2-1B-Instruct"
 TINYLLAMA_MODEL = "TinyLlama/TinyLlama-1.1B-Chat-v1.0"
 BERT_MODEL = "bert-base-uncased"
-SIMILARITY_THRESHOLD = 0.40   # base cosine similarity gate for pruning
-THRESHOLD_STEP = 0.10         # increase threshold by this much per depth level
+SIMILARITY_THRESHOLD = 0.35   # base cosine similarity gate for pruning
+THRESHOLD_STEP = 0.20         # increase threshold by this much per depth level
 BERT_MAX_WORDS = 380           # ~512 tokens — max BERT can actually see
 MIN_CHUNK_WORDS = 40           # stop recursing — "few sentences" leaf size
 MAX_RECURSION_DEPTH = 3
