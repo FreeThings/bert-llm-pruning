@@ -145,7 +145,7 @@ class LlamaClassifier:
         else:
             model = AutoModelForCausalLM.from_pretrained(
                 model_name,
-                torch_dtype=torch.float32,
+                dtype=torch.float32,
                 device_map="cpu",
             )
 
@@ -155,6 +155,7 @@ class LlamaClassifier:
             model=model,
             tokenizer=self.tokenizer,
             max_new_tokens=16,
+            max_length=None,
             do_sample=False,
             temperature=None,
             top_p=None,
@@ -486,7 +487,8 @@ def run_evaluation(
     stats.wall_time = time.time() - t0
 
     report = classification_report(
-        ground_truths, predictions, labels=["yes", "no"], output_dict=True
+        ground_truths, predictions, labels=["yes", "no"],
+        output_dict=True, zero_division=0,
     )
 
     return {
