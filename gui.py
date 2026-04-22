@@ -154,7 +154,6 @@ class App(tk.Tk):
         cmd += ["--seed", str(self.seed_var.get())]
         cmd += ["--split", self.split_var.get()]
         cmd += ["--output", self.output_var.get()]
-        cmd += ["--query", self.query_var.get()]
 
         modes = []
         if self.mode_full_var.get():
