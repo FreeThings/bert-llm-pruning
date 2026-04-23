@@ -105,10 +105,10 @@ Runs a coarse + fine grid search to find optimal pruning thresholds before evalu
 python classify_nq.py --tiny --n 150 --tune --output results_tuned.json
 ```
 
-### Custom threshold and modes
+### Run bert-only with custom threshold
 
 ```bash
-python classify_nq.py --tiny --n 100 --threshold 0.40 --modes bert random
+python classify_nq.py --tiny --n 100 --threshold 0.25 --modes bert
 ```
 
 ### Smoke test (verify setup, no meaningful metrics)
@@ -123,10 +123,12 @@ python classify_nq.py --tiny --n 5 --max-doc-words 200
 |------|---------|-------------|
 | `--n` | `50` | Number of NQ examples to evaluate (use ≥150 for reliable tuning) |
 | `--local-data` | — | Path to local JSON of pre-downloaded NQ examples (skips streaming) |
+| `--save-data` | — | Save loaded examples to a JSON file for offline reuse |
 | `--split` | `validation` | NQ dataset split (`train` or `validation`) |
-| `--threshold` | `0.35` | Base BERT cosine similarity cutoff for pruning |
-| `--threshold-step` | `0.20` | How much the threshold tightens per recursion depth |
-| `--aggregation` | `soft` | `soft` = weighted mean of BERT scores; `hard` = any yes → yes |
+| `--threshold` | `0.23` | Base BERT cosine similarity cutoff for pruning (tuned) |
+| `--threshold-step` | `0.08` | How much the threshold tightens per recursion depth (tuned) |
+| `--aggregation` | `hard` | `hard` = any yes → yes (default); `soft` = weighted mean of BERT scores |
+| `--doc-score-threshold` | `0.0` | Soft aggregation cutoff (unused in hard mode) |
 | `--tiny` | off | Use TinyLlama instead of Llama (no auth required) |
 | `--llama-model` | `meta-llama/Llama-3.2-1B-Instruct` | HuggingFace model ID (overrides `--tiny`) |
 | `--max-doc-words` | `0` | Truncate documents to N words (0 = no limit; use 200 for quick smoke tests) |
@@ -152,17 +154,22 @@ Results are printed as a summary table and saved to `results.json`.
 
 ## Local test data
 
-Streaming NQ from HuggingFace can be slow on first load. To avoid this, download a sample once and reuse it:
+Streaming NQ from HuggingFace can be slow on first load. Save examples locally once and reuse them:
 
 ```bash
-# Download 50 examples to test_data/nq_sample_50.json (one-time, takes a few minutes)
-python test_data/download_nq_sample.py --n 50
+# Stream and save 200 examples (one-time)
+python classify_nq.py --tiny --n 200 --save-data nq_200.json --modes bert --output /dev/null
 
-# Run using the local data (instant loading)
-python classify_nq.py --tiny --local-data test_data/nq_sample_50.json --modes bert random
+# All subsequent runs load instantly
+python classify_nq.py --tiny --local-data nq_200.json --modes bert
 ```
 
-The download script accepts `--n`, `--split`, `--max-doc-words`, and `--seed` flags.
+Alternatively, use the standalone download script in `test_data/`:
+
+```bash
+python test_data/download_nq_sample.py --n 50
+python classify_nq.py --tiny --local-data test_data/nq_sample_50.json --modes bert
+```
 
 ## Notes
 

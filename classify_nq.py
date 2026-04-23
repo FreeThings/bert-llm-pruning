@@ -20,6 +20,7 @@ Evaluation compares three modes:
 
 import argparse
 import json
+import os
 import random
 import time
 from dataclasses import dataclass, field
@@ -46,13 +47,13 @@ TINYLLAMA_MODEL = "TinyLlama/TinyLlama-1.1B-Chat-v1.0"
 # sentence-transformers model: trained for semantic similarity, much better
 # cosine scores than bert-base-uncased for question-passage matching
 BERT_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
-SIMILARITY_THRESHOLD = 0.35   # base cosine similarity gate for pruning
-THRESHOLD_STEP = 0.20         # increase threshold by this much per depth level
+SIMILARITY_THRESHOLD = 0.23   # base cosine similarity gate for pruning (tuned)
+THRESHOLD_STEP = 0.08         # increase threshold by this much per depth level (tuned)
 BERT_MAX_WORDS = 380           # ~512 tokens — max BERT can actually see
 MIN_CHUNK_WORDS = 40           # stop recursing — "few sentences" leaf size
 MAX_RECURSION_DEPTH = 3
 MAX_DOC_WORDS = 0             # 0 = no truncation
-DOC_SCORE_THRESHOLD = 0.10    # soft aggregation threshold (lower default for mean-based scoring)
+DOC_SCORE_THRESHOLD = 0.0     # soft aggregation threshold (unused in hard mode)
 
 # Chunk sizes per depth level
 CHUNK_WORDS_BY_DEPTH = [BERT_MAX_WORDS, 150, 40]
@@ -155,7 +156,6 @@ class LlamaClassifier:
             model=model,
             tokenizer=self.tokenizer,
             max_new_tokens=16,
-            max_length=None,
             do_sample=False,
             temperature=None,
             top_p=None,
@@ -177,12 +177,11 @@ class LlamaClassifier:
 
     def _parse_answer(self, result: str, prompt: str) -> str:
         answer = result[len(prompt):].strip().lower()
+        if answer.startswith("yes"):
+            return "yes"
+        if answer.startswith("no"):
+            return "no"
         return "yes" if "yes" in answer else "no"
-
-    def classify(self, query: str, text: str) -> str:
-        prompt = self._make_prompt(query, text)
-        result = self.pipe(prompt)[0]["generated_text"]
-        return self._parse_answer(result, prompt)
 
     def classify_batch(self, query: str, texts: list[str]) -> list[str]:
         """Classify a batch of texts in a single pipeline call."""
@@ -233,7 +232,6 @@ def split_into_chunks(text: str, max_words: int, overlap: int) -> list[str]:
 
 def _gate_and_chunk(
     node: TextNode,
-    question: str,
     bert_query_embedding: np.ndarray,
     embedder: BertEmbedder,
     stats: RunStats,
@@ -309,7 +307,7 @@ def _gate_and_chunk(
 
     for child in children:
         _gate_and_chunk(
-            child, question, bert_query_embedding, embedder, stats,
+            child, bert_query_embedding, embedder, stats,
             base_threshold, threshold_step, mode, prune_rate, gates_passed,
             pending_leaves,
         )
@@ -432,8 +430,9 @@ def run_evaluation(
     threshold: float = SIMILARITY_THRESHOLD,
     threshold_step: float = THRESHOLD_STEP,
     prune_rate: float = 0.0,
-    aggregation: str = "soft",
+    aggregation: str = "hard",
     doc_score_threshold: float = DOC_SCORE_THRESHOLD,
+    checkpoint_path: str = None,
 ) -> dict:
     """
     Run classification on all examples under the given mode.
@@ -453,17 +452,33 @@ def run_evaluation(
 
     stats = RunStats()
     t0 = time.time()
+    elapsed_before_resume = 0.0
     predictions = []
     ground_truths = []
+    start_idx = 0
 
-    for i, ex in enumerate(examples):
+    if checkpoint_path and os.path.exists(checkpoint_path):
+        with open(checkpoint_path) as f:
+            ckpt = json.load(f)
+        if ckpt.get("mode") == mode:
+            predictions = ckpt["predictions"]
+            ground_truths = ckpt["ground_truths"]
+            stats.llm_calls = ckpt["llm_calls"]
+            stats.bert_calls = ckpt["bert_calls"]
+            stats.pruned_nodes = ckpt["pruned_nodes"]
+            stats.total_nodes = ckpt["total_nodes"]
+            elapsed_before_resume = ckpt.get("elapsed", 0.0)
+            start_idx = len(predictions)
+            print(f"  [Checkpoint] Resuming from example {start_idx}/{len(examples)}")
+
+    for i, ex in enumerate(examples[start_idx:], start=start_idx):
         q_emb = question_embeddings[i : i + 1]
 
         # Phase 1
         root = TextNode(text=ex["document_text"], depth=0)
         pending_leaves: list[TextNode] = []
         _gate_and_chunk(
-            root, ex["question"], q_emb, embedder, stats,
+            root, q_emb, embedder, stats,
             threshold, threshold_step, mode, prune_rate, 0, pending_leaves,
         )
 
@@ -484,7 +499,23 @@ def run_evaluation(
             print(f"  [{mode}] Processed {i+1}/{len(examples)} | "
                   f"LLM calls so far: {stats.llm_calls}")
 
-    stats.wall_time = time.time() - t0
+        if checkpoint_path and (i + 1) % 20 == 0:
+            with open(checkpoint_path, "w") as f:
+                json.dump({
+                    "mode": mode,
+                    "predictions": predictions,
+                    "ground_truths": ground_truths,
+                    "llm_calls": stats.llm_calls,
+                    "bert_calls": stats.bert_calls,
+                    "pruned_nodes": stats.pruned_nodes,
+                    "total_nodes": stats.total_nodes,
+                    "elapsed": elapsed_before_resume + (time.time() - t0),
+                }, f)
+
+    if checkpoint_path and os.path.exists(checkpoint_path):
+        os.remove(checkpoint_path)
+
+    stats.wall_time = elapsed_before_resume + (time.time() - t0)
 
     report = classification_report(
         ground_truths, predictions, labels=["yes", "no"],
@@ -520,7 +551,7 @@ def replay_tree(
     base_threshold: float,
     threshold_step: float,
     doc_score_threshold: float,
-    aggregation: str = "soft",
+    aggregation: str = "hard",
     gates_passed: int = 0,
 ) -> tuple[str, float, int]:
     """
@@ -575,7 +606,7 @@ def run_tuning(
     classifier: LlamaClassifier,
     train_split: float = 0.8,
     seed: int = 42,
-    aggregation: str = "soft",
+    aggregation: str = "hard",
 ) -> dict:
     """
     Tune thresholds using a stratified train/test split.
@@ -624,7 +655,7 @@ def run_tuning(
 
         pending_leaves: list[TextNode] = []
         _gate_and_chunk(
-            root, ex["question"], q_emb, embedder, stats,
+            root, q_emb, embedder, stats,
             0.0, 0.0, "full", 0.0, 0, pending_leaves,
         )
         if pending_leaves:
@@ -686,7 +717,7 @@ def run_tuning(
     print("  [Tuning] Coarse grid search ...")
     base_coarse = [round(x, 2) for x in np.arange(0.20, 0.65, 0.05)]
     step_coarse = [round(x, 2) for x in np.arange(0.00, 0.30, 0.05)]
-    doc_coarse  = [0.0, 0.05, 0.10, 0.20, 0.35, 0.50]
+    doc_coarse  = [0.0] if aggregation == "hard" else [0.0, 0.05, 0.10, 0.20, 0.35, 0.50]
     best_coarse, all_combos = _sweep(base_coarse, step_coarse, doc_coarse)
     print(f"    {len(all_combos)} combos | best coarse F1: {best_coarse['train_f1']:.3f} "
           f"base={best_coarse['base_threshold']:.2f} "
@@ -700,7 +731,7 @@ def run_tuning(
     d0 = best_coarse["doc_score_threshold"]
     base_fine = [round(x, 3) for x in np.arange(max(0.05, b0 - 0.08), min(0.95, b0 + 0.09), 0.02)]
     step_fine = [round(x, 3) for x in np.arange(max(0.00, s0 - 0.08), min(0.50, s0 + 0.09), 0.02)]
-    doc_fine  = [round(x, 3) for x in np.arange(max(0.00, d0 - 0.08), min(0.90, d0 + 0.09), 0.02)]
+    doc_fine  = [0.0] if aggregation == "hard" else [round(x, 3) for x in np.arange(max(0.00, d0 - 0.08), min(0.90, d0 + 0.09), 0.02)]
     best_fine, fine_combos = _sweep(base_fine, step_fine, doc_fine)
     all_combos.extend(fine_combos)
     print(f"    {len(fine_combos)} fine combos | best fine F1: {best_fine['train_f1']:.3f} "
@@ -745,13 +776,27 @@ def run_tuning(
 def _score_tree_bert(node: TextNode, query_emb: np.ndarray,
                      embedder: BertEmbedder, stats: RunStats):
     """Walk a tree and add BERT scores to every node that fits in BERT's window."""
-    words = node.text.strip().split()
-    if len(words) <= BERT_MAX_WORDS and node.bert_score is None:
-        emb = embedder.embed([node.text.strip()])
-        stats.bert_calls += 1
-        node.bert_score = float(embedder.cosine_similarity(query_emb, emb)[0])
-    for child in node.children:
-        _score_tree_bert(child, query_emb, embedder, stats)
+    pending = []
+    def _collect(n):
+        if len(n.text.strip().split()) <= BERT_MAX_WORDS and n.bert_score is None:
+            pending.append(n)
+        for c in n.children:
+            _collect(c)
+    _collect(node)
+
+    if not pending:
+        return
+
+    texts = [n.text.strip() for n in pending]
+    emb_batches = [
+        embedder.embed(texts[i : i + 32])
+        for i in range(0, len(texts), 32)
+    ]
+    embs = np.concatenate(emb_batches, axis=0)
+    sims = embedder.cosine_similarity(query_emb, embs)
+    for n, sim in zip(pending, sims):
+        n.bert_score = float(sim)
+    stats.bert_calls += len(pending)
 
 
 def print_results(results: dict):
@@ -794,9 +839,9 @@ def main():
         help="Threshold increase per recursion depth (default: 0.20)",
     )
     parser.add_argument(
-        "--aggregation", type=str, default="soft",
+        "--aggregation", type=str, default="hard",
         choices=["soft", "hard"],
-        help="'soft' = weighted mean of BERT scores; 'hard' = any yes → yes",
+        help="'hard' = any yes → yes (default); 'soft' = weighted mean of BERT scores",
     )
     parser.add_argument("--llama-model", type=str, default=None)
     parser.add_argument("--tiny", action="store_true",
@@ -810,8 +855,14 @@ def main():
         "--max-doc-words", type=int, default=MAX_DOC_WORDS,
         help="Truncate documents to this many words (0 = no limit)",
     )
+    parser.add_argument(
+        "--doc-score-threshold", type=float, default=DOC_SCORE_THRESHOLD,
+        help="Soft aggregation threshold (default: 0.10; unused in hard mode)",
+    )
     parser.add_argument("--local-data", type=str, default=None,
                         help="Path to local JSON of pre-downloaded NQ examples")
+    parser.add_argument("--save-data", type=str, default=None,
+                        help="Save loaded examples to this JSON path for offline reuse")
     parser.add_argument("--tune", action="store_true",
                         help="Tune thresholds via coarse+fine grid search before evaluation")
     parser.add_argument("--train-split", type=float, default=0.8)
@@ -842,6 +893,11 @@ def main():
         examples = load_nq_examples(
             n=args.n, split=args.split, max_doc_words=args.max_doc_words or None,
         )
+
+    if args.save_data:
+        with open(args.save_data, "w") as f:
+            json.dump(examples, f, indent=2)
+        print(f"[NQ] Examples saved to {args.save_data}")
 
     print("[BERT] Pre-computing question embeddings ...")
     questions = [ex["question"] for ex in examples]
@@ -885,9 +941,6 @@ def main():
             json.dump(tune_output, f, indent=2)
         print(f"  [Tuning] Results saved to {tune_path}")
 
-    if not hasattr(args, "doc_score_threshold"):
-        args.doc_score_threshold = DOC_SCORE_THRESHOLD
-
     modes = list(args.modes)
     if "bert" in modes and "random" in modes:
         modes.sort(key=lambda m: 0 if m == "full" else (1 if m == "bert" else 2))
@@ -899,6 +952,7 @@ def main():
               "defaults to 0.0. Add 'bert' to --modes for a matched comparison.")
 
     for mode in modes:
+        ckpt_path = args.output.replace(".json", f".{mode}.ckpt")
         result = run_evaluation(
             examples=examples,
             question_embeddings=question_embeddings,
@@ -910,6 +964,7 @@ def main():
             prune_rate=bert_prune_rate,
             aggregation=args.aggregation,
             doc_score_threshold=args.doc_score_threshold,
+            checkpoint_path=ckpt_path,
         )
         if mode == "bert":
             s = result["stats"]
