@@ -1,0 +1,14 @@
+[
+  {
+    "mode": "bert",
+    "llm_calls": 277,
+    "bert_calls": 730,
+    "pruned_nodes": 299,
+    "total_nodes": 733,
+    "wall_time": 58.15378975868225,
+    "accuracy": 0.6666666666666666,
+    "f1_yes": 0.8,
+    "precision_yes": 0.6666666666666666,
+    "recall_yes": 1.0
+  }
+]

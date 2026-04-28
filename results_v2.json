@@ -1,0 +1,38 @@
+[
+  {
+    "mode": "full",
+    "llm_calls": 18049,
+    "bert_calls": 0,
+    "pruned_nodes": 0,
+    "total_nodes": 22930,
+    "wall_time": 3634.0661239624023,
+    "accuracy": 0.6,
+    "f1_yes": 0.7368421052631579,
+    "precision_yes": 0.6222222222222222,
+    "recall_yes": 0.9032258064516129
+  },
+  {
+    "mode": "bert",
+    "llm_calls": 75,
+    "bert_calls": 7975,
+    "pruned_nodes": 6199,
+    "total_nodes": 8025,
+    "wall_time": 47.71796178817749,
+    "accuracy": 0.38,
+    "f1_yes": 0.0,
+    "precision_yes": 0.0,
+    "recall_yes": 0.0
+  },
+  {
+    "mode": "random",
+    "llm_calls": 207,
+    "bert_calls": 0,
+    "pruned_nodes": 2219,
+    "total_nodes": 2903,
+    "wall_time": 61.772528409957886,
+    "accuracy": 0.38,
+    "f1_yes": 0.0,
+    "precision_yes": 0.0,
+    "recall_yes": 0.0
+  }
+]

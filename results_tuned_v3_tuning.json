@@ -1,0 +1,96 @@
+{
+  "best_params": {
+    "base_threshold": 0.23,
+    "threshold_step": 0.08,
+    "doc_score_threshold": 0.0,
+    "train_f1": 0.8060836501901141,
+    "train_accuracy": 0.6792452830188679,
+    "train_llm_calls": 18959
+  },
+  "test_accuracy": 0.6829268292682927,
+  "test_f1_yes": 0.8059701492537313,
+  "train_size": 159,
+  "test_size": 41,
+  "top_10_combos": [
+    {
+      "base_threshold": 0.23,
+      "threshold_step": 0.08,
+      "doc_score_threshold": 0.0,
+      "train_f1": 0.8060836501901141,
+      "train_accuracy": 0.6792452830188679,
+      "train_llm_calls": 18959
+    },
+    {
+      "base_threshold": 0.23,
+      "threshold_step": 0.08,
+      "doc_score_threshold": 0.02,
+      "train_f1": 0.8060836501901141,
+      "train_accuracy": 0.6792452830188679,
+      "train_llm_calls": 18959
+    },
+    {
+      "base_threshold": 0.23,
+      "threshold_step": 0.08,
+      "doc_score_threshold": 0.04,
+      "train_f1": 0.8060836501901141,
+      "train_accuracy": 0.6792452830188679,
+      "train_llm_calls": 18959
+    },
+    {
+      "base_threshold": 0.23,
+      "threshold_step": 0.08,
+      "doc_score_threshold": 0.06,
+      "train_f1": 0.8060836501901141,
+      "train_accuracy": 0.6792452830188679,
+      "train_llm_calls": 18959
+    },
+    {
+      "base_threshold": 0.23,
+      "threshold_step": 0.08,
+      "doc_score_threshold": 0.08,
+      "train_f1": 0.8060836501901141,
+      "train_accuracy": 0.6792452830188679,
+      "train_llm_calls": 18959
+    },
+    {
+      "base_threshold": 0.19,
+      "threshold_step": 0.1,
+      "doc_score_threshold": 0.0,
+      "train_f1": 0.8060836501901141,
+      "train_accuracy": 0.6792452830188679,
+      "train_llm_calls": 19066
+    },
+    {
+      "base_threshold": 0.19,
+      "threshold_step": 0.1,
+      "doc_score_threshold": 0.02,
+      "train_f1": 0.8060836501901141,
+      "train_accuracy": 0.6792452830188679,
+      "train_llm_calls": 19066
+    },
+    {
+      "base_threshold": 0.19,
+      "threshold_step": 0.1,
+      "doc_score_threshold": 0.04,
+      "train_f1": 0.8060836501901141,
+      "train_accuracy": 0.6792452830188679,
+      "train_llm_calls": 19066
+    },
+    {
+      "base_threshold": 0.19,
+      "threshold_step": 0.1,
+      "doc_score_threshold": 0.06,
+      "train_f1": 0.8060836501901141,
+      "train_accuracy": 0.6792452830188679,
+      "train_llm_calls": 19066
+    },
+    {
+      "base_threshold": 0.19,
+      "threshold_step": 0.1,
+      "doc_score_threshold": 0.08,
+      "train_f1": 0.8060836501901141,
+      "train_accuracy": 0.6792452830188679,
+      "train_llm_calls": 19066
+    }
+  ]
+}
